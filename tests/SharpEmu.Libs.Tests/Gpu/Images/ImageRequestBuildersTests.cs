@@ -196,10 +196,12 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         var words = RegisterWords.Texture(Base, GuestPixelFormat.Bits8_8_8_8UNorm, 64, 64, baseLevel: 1, lastLevel: 2, maxMip: 2);
         var request = ImageRequestBuilders.Texture(words, Sampled2D).Request;
 
-        Assert.Equal(3u, request.Description.Resources.Levels);
+        // The image holds the descriptor's resident mips 1..2; the layout still spans the guest chain.
+        Assert.Equal(1u, request.Description.FirstLevel);
+        Assert.Equal(2u, request.Description.Resources.Levels);
         Assert.True(request.Description.MipLayout[2].Size > 0);
         Assert.NotEqual(request.Description.MipLayout[1].Offset, request.Description.MipLayout[2].Offset);
-        Assert.Equal(1u, request.View.BaseLevel);
+        Assert.Equal(0u, request.View.BaseLevel);
         Assert.Equal(2u, request.View.LevelCount);
     }
 
@@ -350,6 +352,24 @@ public sealed class ImageRequestBuildersTests : IClassFixture<HeadlessVulkanFixt
         Assert.Throws<SchedulerFatalException>(() => ImageRequestBuilders.DisplaySurface(new DisplaySurfaceWords(Base, 0, 0x8000000022000000, 0, 1080, 0, 0, 0, 0, false)));
         Assert.Equal(3, fatal.Messages.Count);
     }
+
+    [Theory]
+    [InlineData(0x00, 0f, 0f, 0f, 0f)]
+    [InlineData(0x40, 0f, 0f, 0f, 1f)]
+    [InlineData(0x80, 1f, 1f, 1f, 0f)]
+    [InlineData(0xc0, 1f, 1f, 1f, 1f)]
+    public void FixedDccClearCodes_DecompressToTheirColor(byte code, float r, float g, float b, float a)
+    {
+        Assert.True(ImageRequestBuilders.TryFixedDccClearValue(code, out var value));
+        Assert.Equal([r, g, b, a], [value.Float32_0, value.Float32_1, value.Float32_2, value.Float32_3]);
+    }
+
+    [Theory]
+    [InlineData(0x20)]
+    [InlineData(0x10)]
+    [InlineData(0xff)]
+    public void OtherDccCodes_AreNotFixedClears(byte code) =>
+        Assert.False(ImageRequestBuilders.TryFixedDccClearValue(code, out _));
 
     private readonly record struct GuestSpanCheck(ulong Address, ulong Size);
 }

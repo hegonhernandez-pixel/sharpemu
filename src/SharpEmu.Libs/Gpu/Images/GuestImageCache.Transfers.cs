@@ -107,7 +107,8 @@ public sealed unsafe partial class GuestImageCache
             plan.SwapBgra16 = info.Bgra16;
         }
 
-        plan.Layout = TextureTransferLayout.Compute(format, info.Extent.Width, info.Extent.Height, info.Resources.Levels, layers, info.TileMode, info.Data.Size, allowDepthTile, volume, owner);
+        var guestLevels = info.FirstLevel + info.Resources.Levels;
+        plan.Layout = TextureTransferLayout.Compute(format, info.Extent.Width, info.Extent.Height, guestLevels, layers, info.TileMode, info.Data.Size, allowDepthTile, volume, owner);
         plan.Regions = plan.Layout.BuildCopies();
         if (info.IsDepth)
         {
@@ -121,13 +122,26 @@ public sealed unsafe partial class GuestImageCache
         plan.Tiled = plan.Layout.Surface.Description.TileMode != GuestTileMode.Linear;
         if (plan.Tiled)
         {
-            if (!plan.Layout.TryBuildTileTransfers(info.Data.Size, plan.Regions, info.Resources.Levels, out var tiles))
+            if (!plan.Layout.TryBuildTileTransfers(info.Data.Size, plan.Regions, guestLevels, out var tiles))
             {
                 return plan;
             }
 
             plan.Tiles = tiles;
             plan.LinearSize = LinearSizeOf(plan.Tiles);
+        }
+
+        // Only the resident mips have host levels: guest level L lands on host level L - FirstLevel.
+        var firstLevel = info.FirstLevel;
+        if (firstLevel != 0)
+        {
+            plan.Regions.RemoveAll(region => region.ImageSubresource.MipLevel < firstLevel);
+            for (var index = 0; index < plan.Regions.Count; index++)
+            {
+                var region = plan.Regions[index];
+                region.ImageSubresource.MipLevel -= firstLevel;
+                plan.Regions[index] = region;
+            }
         }
 
         plan.Valid = true;
@@ -142,7 +156,8 @@ public sealed unsafe partial class GuestImageCache
     {
         ref readonly var info = ref image.Description;
         var plan = new ImageDownloadPlan { Depth = info.IsDepth };
-        if (info.Samples != 1 || image.Backing.Samples != 1)
+        // A streamed texture holds only its resident mips; the guest chain is not all there.
+        if (info.Samples != 1 || image.Backing.Samples != 1 || info.FirstLevel != 0)
         {
             return plan;
         }
@@ -573,17 +588,51 @@ public sealed unsafe partial class GuestImageCache
             }
         }
 
-        if (!selected.IsValid)
+        var synchronized = false;
+        if (selected.IsValid)
         {
-            return false;
+            var target = selected;
+            if (_slots.TryGet(target) is { DepthOwner.IsValid: true } proxy)
+            {
+                target = proxy.DepthOwner;
+            }
+
+            synchronized = TryDownloadImageToBuffer(_slots[target], buffer);
         }
 
-        if (_slots.TryGet(selected) is { DepthOwner.IsValid: true } proxy)
+        // Every other image the view covers is memory the shader can read or partly
+        // rewrite: its GPU-only contents move into the buffer before the bind hands
+        // the range to the buffer. Aliased images are left out, their order unknown.
+        var covered = new List<ResourceSlotIdentifier>();
+        foreach (var identifier in FindImagesInRange(address, size, pageOverlap: false))
         {
-            selected = proxy.DepthOwner;
+            if (identifier != selected && _slots.TryGet(identifier) is { DepthOwner.IsValid: false } candidate &&
+                candidate.Description.Data.Address >= address &&
+                candidate.Description.Data.Size <= address + size - candidate.Description.Data.Address)
+            {
+                covered.Add(identifier);
+            }
         }
 
-        var image = _slots[selected];
+        foreach (var identifier in covered)
+        {
+            var image = _slots[identifier];
+            if (image.BufferHoldsGpuContents || !CanReadBack(image) ||
+                (selected.IsValid && _slots[selected].Overlaps(image.Description.Data.Address, image.Description.Data.Size)) ||
+                covered.Any(other => other != identifier &&
+                    _slots[other].Overlaps(image.Description.Data.Address, image.Description.Data.Size)))
+            {
+                continue;
+            }
+
+            synchronized |= TryDownloadImageToBuffer(image, buffer);
+        }
+
+        return synchronized;
+    }
+
+    private bool TryDownloadImageToBuffer(CachedImage image, GpuBuffer buffer)
+    {
         ref readonly var info = ref image.Description;
         if (!buffer.IsInBounds(info.Data.Address, 1))
         {

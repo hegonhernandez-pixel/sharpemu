@@ -134,6 +134,8 @@ public sealed unsafe class GpuTiler : IDisposable
 
     public void Dispose()
     {
+        _uploadRing?.Dispose();
+        _uploadRing = null;
         var vk = _device.Vk;
         foreach (var pipeline in _pipelines)
         {
@@ -170,6 +172,15 @@ public sealed unsafe class GpuTiler : IDisposable
 
     private ulong StorageAlignment => Math.Max(_device.MinStorageBufferOffsetAlignment, 4);
 
+    // Scratch still waiting on its tick. A burst of uploads in one tick (a bindless title
+    // materializing thousands of textures) would otherwise keep every scratch alive at once.
+    private const ulong OutstandingScratchBudget = 256UL << 20;
+    private ulong _outstandingScratch;
+
+    // The owner ends the tick at its next safe point (before a draw or dispatch binds state)
+    // so completed scratch is released; a tick cannot end in the middle of an upload.
+    public bool ScratchOverBudget => Interlocked.Read(ref _outstandingScratch) > OutstandingScratchBudget;
+
     // The scratch stays alive through the current tick; a completion action frees it.
     private GpuBuffer AllocateScratch(ulong size)
     {
@@ -180,8 +191,49 @@ public sealed unsafe class GpuTiler : IDisposable
 
         var buffer = new GpuBuffer(_device, _scheduler, GpuBufferUsage.DeviceLocal, 0,
             BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit, size);
-        _scheduler.QueueCompletionAction(buffer.Dispose);
+        Interlocked.Add(ref _outstandingScratch, size);
+        _scheduler.QueueCompletionAction(() =>
+        {
+            buffer.Dispose();
+            Interlocked.Add(ref _outstandingScratch, unchecked(0UL - size));
+        });
         return buffer;
+    }
+
+    // Upload scratch comes from one ring reused across uploads and ticks. Every tile record
+    // starts with an all-commands barrier on its target range, which also orders it after
+    // earlier reads of that range, so a burst of uploads inside one draw stays bounded.
+    private const ulong UploadRingSize = 256UL << 20;
+    private const ulong UploadRingAlignment = 256;
+    private GpuBuffer? _uploadRing;
+    private ulong _uploadRingOffset;
+
+    private TilerBufferSpan AllocateUploadScratch(ulong size)
+    {
+        size = (size + 3) & ~3UL;
+        if (size > UploadRingSize)
+        {
+            var dedicated = AllocateScratch(size);
+            return new TilerBufferSpan(dedicated.Handle, 0, dedicated.Size);
+        }
+
+        _uploadRing ??= new GpuBuffer(_device, _scheduler, GpuBufferUsage.DeviceLocal, 0,
+            BufferUsageFlags.StorageBufferBit | BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit, UploadRingSize);
+        var alignment = Math.Max(UploadRingAlignment, StorageAlignment);
+        var offset = (_uploadRingOffset + alignment - 1) / alignment * alignment;
+        if (offset + size > UploadRingSize)
+        {
+            // Wrapping: all earlier ring accesses finish before the ring is written again.
+            offset = 0;
+            _scheduler.EndRendering();
+            var barrier = Barrier(_uploadRing.Handle, 0, UploadRingSize,
+                AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit, AccessFlags.MemoryReadBit | AccessFlags.MemoryWriteBit);
+            VulkanSynchronization.PipelineBarrier(_device.Vk, new CommandBuffer(_scheduler.Current.Handle),
+                PipelineStageFlags.AllCommandsBit, PipelineStageFlags.AllCommandsBit, 0, 0, null, 1, &barrier, 0, null);
+        }
+
+        _uploadRingOffset = offset + size;
+        return new TilerBufferSpan(_uploadRing.Handle, offset, size);
     }
 
     private Pipeline CreateComputePipeline(byte[] spirv, string operation)
@@ -536,9 +588,9 @@ public sealed unsafe class GpuTiler : IDisposable
         var sourceBase = tiledOffset & (StorageAlignment - 1);
         var dispatches = new List<TransferDispatch>();
         Prepare(false, tiledCapacity, linearCapacity, transfers, sourceBase, 0, dispatches);
-        var scratch = AllocateScratch((linearCapacity + 3) & ~3UL);
-        Record(false, tiled, tiledOffset, tiledCapacity, scratch.Handle, 0, scratch.Size, dispatches, true);
-        return new TilerBufferSpan(scratch.Handle, 0, linearCapacity);
+        var scratch = AllocateUploadScratch(linearCapacity);
+        Record(false, tiled, tiledOffset, tiledCapacity, scratch.Buffer, scratch.Offset, scratch.Size, dispatches, true);
+        return new TilerBufferSpan(scratch.Buffer, scratch.Offset, linearCapacity);
     }
 
     public void Tile(VkBuffer linear, ulong linearOffset, ulong linearCapacity, VkBuffer tiled, ulong tiledOffset, ulong tiledCapacity, ReadOnlySpan<TileTransfer> transfers)
@@ -784,8 +836,7 @@ public sealed unsafe class GpuTiler : IDisposable
             throw SubmissionScheduler.Fatal($"The BGRA16 swap input size is invalid: size={input.Size}.");
         }
 
-        var output = AllocateScratch(input.Size);
-        var result = new TilerBufferSpan(output.Handle, 0, output.Size);
+        var result = AllocateUploadScratch(input.Size);
         SwapBgra16(input, result, (uint)(input.Size / 8));
         return result;
     }
